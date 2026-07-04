@@ -601,11 +601,20 @@ unsafe fn update_window_title() {
     if WINDOW.is_null() {
         return;
     }
-    let title = with_document(|doc| {
-        let dirty = if doc.is_edited() { " •" } else { "" };
-        format!("{}{} — notypo", doc.display_name(), dirty)
-    });
+    let (title, path, edited) =
+        with_document(|doc| (doc.display_name(), doc.path.clone(), doc.is_edited()));
+    // Typora-style titlebar: show only the clean document name. AppKit renders
+    // it centered in the merged (full-size-content) titlebar — no " — notypo"
+    // app-name suffix and no manual dirty bullet.
     let _: () = msg_send![WINDOW, setTitle: nsstring(&title)];
+    // Set the represented file so AppKit draws the document proxy icon next to
+    // the title (and lays the title out as a standard centered document
+    // window). An empty string clears it for untitled documents.
+    let represented = path.unwrap_or_default();
+    let _: () = msg_send![WINDOW, setRepresentedFilename: nsstring(&represented)];
+    // Native "edited" indicator (shown on the proxy icon / close button)
+    // instead of appending a bullet to the title text.
+    let _: () = msg_send![WINDOW, setDocumentEdited: if edited { YES } else { NO }];
 }
 
 unsafe fn move_window_by(dx: f64, dy: f64) {
