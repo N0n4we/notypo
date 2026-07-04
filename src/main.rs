@@ -1262,16 +1262,33 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
             size: NSSize { width: 1200.0, height: 800.0 },
         };
 
+        // Style mask: Titled(1) | Closable(2) | Miniaturizable(4) | Resizable(8)
+        // | FullSizeContentView(1<<15 = 32768) = 32783.
+        //
+        // FullSizeContentView is the key bit that "merges the titlebar into the
+        // UI" (Typora-style seamless mode): it lets the content view — and thus
+        // our WKWebView — extend up *behind* the titlebar, all the way to the top
+        // edge of the window, instead of being inset below a separate titlebar
+        // strip. Combined with `setTitlebarAppearsTransparent:YES`, the traffic
+        // lights float over the web content and TypeMark's `.mac-seamless-mode`
+        // layout (which reserves `--title-bar-height` at the top of `content` and
+        // `padding-top` on the sidebar) lines up under them.
+        const FULL_SIZE_CONTENT_VIEW: u64 = 1 << 15;
+        let style_mask: u64 = 15 | FULL_SIZE_CONTENT_VIEW; // 32783
         let win: *mut Object = msg_send![class!(NSWindow), alloc];
         let win: *mut Object =
-            msg_send![win, initWithContentRect: rect styleMask: 15u64 backing: 2u64 defer: NO];
+            msg_send![win, initWithContentRect: rect styleMask: style_mask backing: 2u64 defer: NO];
         WINDOW = win;
         update_window_title();
         let _: () = msg_send![win, setTitlebarAppearsTransparent: YES];
-        // Hide the native title text — in seamless mode TypeMark renders its
-        // own `<titlebar>`/#title-text, and hiding the native title avoids it
-        // overlapping the sidebar when the outline is shown.
-        let _: () = msg_send![win, setTitleVisibility: 1u64];
+        // Keep the native title *visible* (NSWindowTitleVisible = 0). The release
+        // TypeMark DOM has no `#title-text`/`#top-titlebar` element (that's only
+        // for the Windows/Linux custom chrome), so the document name can only be
+        // shown via the native window title. With the full-size content view it is
+        // drawn centered over the web content — matching Typora, where the file
+        // name sits in the middle of the merged titlebar. It won't collide with
+        // the left-hand outline sidebar, which is far from the centered title.
+        let _: () = msg_send![win, setTitleVisibility: 0u64];
         let _: () = msg_send![win, center];
         let _: () = msg_send![win, setReleasedWhenClosed: NO];
 
