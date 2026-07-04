@@ -1,3 +1,10 @@
+> [!NOTE]
+> Deprecated 搁置中
+>
+> 功能还没做完，已经几乎不可维护
+>
+> 等我哪天学Rust重新做一个
+
 # Notypo
 
 <p align="center"><img src="N_logo_transparent.png" alt="Notypo logo" width="320"></p>
