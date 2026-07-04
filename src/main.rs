@@ -1318,6 +1318,7 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
              theme:'{theme}',\
              curTheme:'{theme}',\
              hasLicense:true,\
+             enableDiagram:true,\
              currentThemeFolder:'{TYPE_MARK}/style/themes',\
              appPath:'{TYPE_MARK}',\
              userDataPath:'{home}/Library/Application Support/notypo',\
