@@ -269,10 +269,51 @@ fn call_sync(name: &str, method: &str, data: &serde_json::Value) -> String {
     }
 }
 
+/// Detect whether macOS is currently in Dark Mode by inspecting the app's
+/// effective appearance. Uses `bestMatchFromAppearancesWithNames:` because the
+/// effective appearance can be a composite, and matching against the two base
+/// appearance names is the officially recommended way to resolve it.
+unsafe fn system_is_dark() -> bool {
+    let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+    if app.is_null() {
+        return false;
+    }
+    let appearance: *mut Object = msg_send![app, effectiveAppearance];
+    if appearance.is_null() {
+        return false;
+    }
+    let names: *mut Object = msg_send![class!(NSMutableArray), array];
+    let _: () = msg_send![names, addObject: nsstring("NSAppearanceNameAqua")];
+    let _: () = msg_send![names, addObject: nsstring("NSAppearanceNameDarkAqua")];
+    let best: *mut Object = msg_send![appearance, bestMatchFromAppearancesWithNames: names];
+    match nsstr_to_string(best) {
+        Some(name) => name.contains("Dark"),
+        None => false,
+    }
+}
+
+/// Pick the document theme based on the system appearance: Typora's built-in
+/// dark theme (`night`) when macOS is in Dark Mode, otherwise `github`.
+fn current_theme() -> &'static str {
+    if unsafe { system_is_dark() } {
+        "night"
+    } else {
+        "github"
+    }
+}
+
+/// Push the current system-appropriate theme into the live webview by swapping
+/// the `#theme_css` stylesheet (via the injected `__notypoSetTheme` helper).
+unsafe fn apply_current_theme_to_webview() {
+    let theme = current_theme();
+    let js = format!("window.__notypoSetTheme && window.__notypoSetTheme('{theme}');");
+    evaluate_js(&js);
+}
+
 /// Read a single setting value by key. Matches Typora's native `setting.get`.
 fn setting_get(key: &str) -> Option<serde_json::Value> {
     match key {
-        "theme" | "curTheme" => Some(serde_json::json!("github")),
+        "theme" | "curTheme" => Some(serde_json::json!(current_theme())),
         "hasLicense" => Some(serde_json::json!(true)),
         "currentThemeFolder" => Some(serde_json::json!(format!("{TYPE_MARK}/style/themes"))),
         "zoomFactor" => Some(serde_json::json!(1.0)),
@@ -1238,6 +1279,18 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
         let pool: *mut Object = msg_send![class!(WKProcessPool), new];
         let _: () = msg_send![cfg, setProcessPool: pool];
 
+        // Allow file://→file:// XHR/fetch. TypeMark loads its diagram engine
+        // (mermaid, flowchart, etc.) with jQuery `getScript`, which issues an
+        // XMLHttpRequest. WKWebView treats every file:// document as a unique
+        // opaque origin and blocks such requests as cross-origin by default, so
+        // without these preferences `mermaid.min.js` never loads and Mermaid
+        // code fences never render. These KVC keys are the standard way to relax
+        // that policy for a trusted local app bundle.
+        let yes_num: *mut Object = msg_send![class!(NSNumber), numberWithBool: YES];
+        let prefs: *mut Object = msg_send![cfg, preferences];
+        let _: () = msg_send![prefs, setValue: yes_num forKey: nsstring("allowFileAccessFromFileURLs")];
+        let _: () = msg_send![cfg, setValue: yes_num forKey: nsstring("allowUniversalAccessFromFileURLs")];
+
         let url_handler: *mut Object = msg_send![class!(NotypoURLHandler), new];
         let _: () = msg_send![cfg, setURLSchemeHandler: url_handler forURLScheme: nsstring("notypo")];
 
@@ -1257,12 +1310,13 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
         // mechanism Typora uses when _bridge is not ready, and the only way to
         // get synchronous JS↔native calls on WKWebView.
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let theme = current_theme();
         let init_js = format!(
             "window.reqnode=undefined;\
              window.require=undefined;\
              window._options={{\
-             theme:'github',\
-             curTheme:'github',\
+             theme:'{theme}',\
+             curTheme:'{theme}',\
              hasLicense:true,\
              currentThemeFolder:'{TYPE_MARK}/style/themes',\
              appPath:'{TYPE_MARK}',\
@@ -1296,9 +1350,25 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
         // native behavior. `mac-supports-vibrant` enables vibrant appearance on
         // the document element; `mac-seamless-mode` gives the `<titlebar>`
         // element its height and enables the seamless titlebar layout.
+        // Also define __notypoSetTheme, a small helper that swaps the active
+        // theme stylesheet at runtime (mirroring the inline `fastSetup` logic in
+        // index.html). Native calls this when the system appearance changes so
+        // the editor follows Light/Dark Mode live.
         let seamless_js = "\
             document.documentElement.classList.add('mac-supports-vibrant');\n\
-            document.body.classList.add('mac-seamless-mode');";
+            document.body.classList.add('mac-seamless-mode');\n\
+            window.__notypoSetTheme = function (theme) {\n\
+              try {\n\
+                var opts = window._options || {};\n\
+                var folder = 'file://' + opts.currentThemeFolder;\n\
+                var css = document.getElementById('theme_css');\n\
+                if (css) css.setAttribute('href', folder + '/' + theme + '.css');\n\
+                var themeUser = document.getElementById('theme_user_css');\n\
+                if (themeUser) themeUser.setAttribute('href', folder + '/' + theme + '.user.css');\n\
+                opts.theme = theme;\n\
+                opts.curTheme = theme;\n\
+              } catch (e) { console.error(e); }\n\
+            };";
         let seamless_script: *mut Object = msg_send![class!(WKUserScript), alloc];
         let seamless_script: *mut Object = msg_send![
             seamless_script,
@@ -1453,6 +1523,26 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
         let access_url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: nsstring(TYPE_MARK)];
         let _: () = msg_send![webview, loadFileURL: index_url allowingReadAccessToURL: access_url];
         let _: () = msg_send![win, makeKeyAndOrderFront: ptr::null::<Object>()];
+
+        // Follow macOS Light/Dark Mode changes at runtime. The system posts
+        // `AppleInterfaceThemeChangedNotification` on the distributed center when
+        // the user toggles appearance; we re-resolve the theme and swap the
+        // stylesheet in the webview.
+        let this_ptr = _this as *const Object as *mut Object;
+        let center: *mut Object = msg_send![class!(NSDistributedNotificationCenter), defaultCenter];
+        let _: () = msg_send![
+            center,
+            addObserver: this_ptr
+            selector: sel!(systemThemeChanged:)
+            name: nsstring("AppleInterfaceThemeChangedNotification")
+            object: ptr::null::<Object>()
+        ];
+    }
+}
+
+extern "C" fn system_theme_changed(_this: &Object, _cmd: Sel, _notification: *mut Object) {
+    unsafe {
+        apply_current_theme_to_webview();
     }
 }
 
@@ -1601,6 +1691,10 @@ fn register_app_delegate() {
         cls.add_method(
             sel!(applicationDidBecomeActive:),
             app_did_become_active as extern "C" fn(&Object, Sel, *mut Object),
+        );
+        cls.add_method(
+            sel!(systemThemeChanged:),
+            system_theme_changed as extern "C" fn(&Object, Sel, *mut Object),
         );
         cls.add_method(
             sel!(application:openFile:),
