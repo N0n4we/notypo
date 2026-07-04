@@ -1,5 +1,7 @@
 # Notypo
 
+<p align="center"><img src="N_logo_transparent.png" alt="Notypo logo" width="320"></p>
+
 Notypo is a macOS Markdown editor built around a Typora-style live preview experience. It embeds the TypeMark editor UI in a native Rust/AppKit shell, so writing, previewing, opening, and saving Markdown files happen in one focused desktop window.
 
 ## Product Features
