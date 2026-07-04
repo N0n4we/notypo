@@ -1428,8 +1428,18 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
             let _: () = msg_send![content_controller, addUserScript: ts];
         }
 
+        // The webview frame is expressed in the content view's coordinate
+        // space (origin at bottom-left), NOT in screen coordinates. Reusing
+        // the window's screen `rect` (origin 200,200) here would offset the
+        // webview inside the content view, leaving an empty band at the bottom
+        // of the window and clipping the top of the document. The content area
+        // is `size` at the origin, so anchor the webview at (0, 0).
+        let webview_frame = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size: rect.size,
+        };
         let webview: *mut Object = msg_send![class!(WKWebView), alloc];
-        let webview: *mut Object = msg_send![webview, initWithFrame: rect configuration: cfg];
+        let webview: *mut Object = msg_send![webview, initWithFrame: webview_frame configuration: cfg];
         WEBVIEW = webview;
         let ui_delegate: *mut Object = msg_send![class!(NotypoUIDelegate), new];
         let _: () = msg_send![webview, setUIDelegate: ui_delegate];
@@ -1505,11 +1515,20 @@ unsafe fn push_file_to_typemark() {
 /// Reload document content from disk and push to TypeMark.
 /// Called when an external file change is detected. Reads the file,
 /// updates DocumentState, and pushes `File.reloadContent` to JS.
+///
+/// No-ops when there is no backing file or when the on-disk content already
+/// matches what we have in memory, so it's safe to call speculatively (e.g.
+/// every time the app regains focus).
 unsafe fn reload_content_from_disk() {
-    let path = with_document(|doc| doc.path.clone());
+    let (path, current) = with_document(|doc| (doc.path.clone(), doc.content.clone()));
     let Some(path) = path else { return };
     let Ok(bytes) = std::fs::read(&path) else { return };
     let content = String::from_utf8_lossy(&bytes).into_owned();
+    // Nothing changed on disk — avoid a pointless editor reload (which would
+    // otherwise disrupt scroll/cursor position).
+    if content == current {
+        return;
+    }
     with_document(|doc| {
         doc.content = content.clone();
         doc.dirty = false;
@@ -1523,6 +1542,17 @@ unsafe fn reload_content_from_disk() {
         serde_json::json!(4), // NSChangeAutoSaved
     );
     update_window_title();
+}
+
+extern "C" fn app_did_become_active(_this: &Object, _cmd: Sel, _notification: *mut Object) {
+    // When the app regains focus, pick up any external edits to the current
+    // file — but only if there are no unsaved changes, so we never clobber the
+    // user's in-flight work. `reload_content_from_disk` itself no-ops when the
+    // on-disk content is unchanged.
+    let has_unsaved = with_document(|doc| doc.is_edited());
+    if !has_unsaved {
+        unsafe { reload_content_from_disk(); }
+    }
 }
 
 extern "C" fn app_open_file(
@@ -1567,6 +1597,10 @@ fn register_app_delegate() {
         cls.add_method(
             sel!(applicationDidFinishLaunching:),
             did_finish_launching as extern "C" fn(&Object, Sel, *mut Object),
+        );
+        cls.add_method(
+            sel!(applicationDidBecomeActive:),
+            app_did_become_active as extern "C" fn(&Object, Sel, *mut Object),
         );
         cls.add_method(
             sel!(application:openFile:),
