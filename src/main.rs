@@ -1158,6 +1158,53 @@ fn register_script_handler() -> bool {
 
 // WKUIDelegate — intercepts `prompt("__bridge__", json)` for synchronous callSync
 
+/// Minimal layout of an Objective-C block (Apple's Block ABI). We only need the
+/// fields up to and including `invoke`, which is the C function pointer that
+/// runs the block's body. The first argument passed to `invoke` is always the
+/// block itself; any declared block parameters follow.
+///
+/// Blocks are NOT ordinary objects that respond to a `call`/`call:` selector —
+/// sending them such a message raises "unrecognized selector" and crashes the
+/// process. WKWebView's `WKUIDelegate` panel methods hand us a completion
+/// handler *block*, so we must invoke it through this ABI instead.
+#[repr(C)]
+struct BlockLayout {
+    isa: *const std::ffi::c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: *const std::ffi::c_void,
+}
+
+/// Invoke a `void (^)(void)` completion block.
+unsafe fn invoke_block_void(block: *mut Object) {
+    if block.is_null() {
+        return;
+    }
+    let layout = &*(block as *const BlockLayout);
+    let invoke: extern "C" fn(*mut Object) = std::mem::transmute(layout.invoke);
+    invoke(block);
+}
+
+/// Invoke a `void (^)(id)` completion block (e.g. prompt's `NSString *result`).
+unsafe fn invoke_block_obj(block: *mut Object, arg: *mut Object) {
+    if block.is_null() {
+        return;
+    }
+    let layout = &*(block as *const BlockLayout);
+    let invoke: extern "C" fn(*mut Object, *mut Object) = std::mem::transmute(layout.invoke);
+    invoke(block, arg);
+}
+
+/// Invoke a `void (^)(BOOL)` completion block (e.g. confirm's result).
+unsafe fn invoke_block_bool(block: *mut Object, arg: BOOL) {
+    if block.is_null() {
+        return;
+    }
+    let layout = &*(block as *const BlockLayout);
+    let invoke: extern "C" fn(*mut Object, BOOL) = std::mem::transmute(layout.invoke);
+    invoke(block, arg);
+}
+
 extern "C" fn run_prompt(
     _this: &Object,
     _cmd: Sel,
@@ -1173,17 +1220,17 @@ extern "C" fn run_prompt(
             // callSync path: default_text is JSON.stringify({name, method, data})
             let payload = nsstr_to_string(default_text).unwrap_or_default();
             let result = handle_call_sync(&payload);
-            let _: () = msg_send![completion, call: nsstring(&result)];
+            invoke_block_obj(completion, nsstring(&result));
         } else if prompt_str == "__alert__" {
             // alert() fallback — just dismiss
-            let _: () = msg_send![completion, call: nsstring("")];
+            invoke_block_obj(completion, nsstring(""));
         } else if prompt_str == "__confirm__" {
             // confirm() fallback — return true
-            let _: () = msg_send![completion, call: nsstring("true")];
+            invoke_block_obj(completion, nsstring("true"));
         } else {
             // Regular prompt — return default text (or empty)
             let default = nsstr_to_string(default_text).unwrap_or_default();
-            let _: () = msg_send![completion, call: nsstring(&default)];
+            invoke_block_obj(completion, nsstring(&default));
         }
     }
 }
@@ -1206,7 +1253,7 @@ extern "C" fn run_alert(
     _frame: *mut Object,
     completion: *mut Object,
 ) {
-    unsafe { let _: () = msg_send![completion, call]; }
+    unsafe { invoke_block_void(completion); }
 }
 
 extern "C" fn run_confirm(
@@ -1217,7 +1264,7 @@ extern "C" fn run_confirm(
     _frame: *mut Object,
     completion: *mut Object,
 ) {
-    unsafe { let _: () = msg_send![completion, call: YES]; }
+    unsafe { invoke_block_bool(completion, YES); }
 }
 
 fn register_ui_delegate() -> bool {
