@@ -15,7 +15,26 @@ use std::ptr;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const TYPE_MARK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/TypeMark");
+// Compile-time path to the TypeMark assets inside the cargo project. Used as a
+// dev fallback when the binary is run straight from `target/`. Packaged builds
+// resolve the bundle copy at runtime via `TYPE_MARK` below.
+const TYPE_MARK_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/TypeMark");
+
+// Resolve the TypeMark assets directory at runtime. In a packaged .app the
+// binary lives at `Notypo.app/Contents/MacOS/notypo`, and the assets are copied
+// to `Notypo.app/Contents/Resources/assets/TypeMark`, so we look there first and
+// fall back to the compile-time project path for `cargo run` / dev builds.
+static TYPE_MARK: LazyLock<String> = LazyLock::new(|| {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(contents) = exe.parent().and_then(|macos| macos.parent()) {
+            let bundled = contents.join("Resources").join("assets").join("TypeMark");
+            if bundled.is_dir() {
+                return bundled.to_string_lossy().into_owned();
+            }
+        }
+    }
+    TYPE_MARK_DEV.to_string()
+});
 
 static mut WEBVIEW: *mut Object = ptr::null_mut();
 static mut WINDOW: *mut Object = ptr::null_mut();
@@ -317,7 +336,7 @@ fn setting_get(key: &str) -> Option<serde_json::Value> {
     match key {
         "theme" | "curTheme" => Some(serde_json::json!(current_theme())),
         "hasLicense" => Some(serde_json::json!(true)),
-        "currentThemeFolder" => Some(serde_json::json!(format!("{TYPE_MARK}/style/themes"))),
+        "currentThemeFolder" => Some(serde_json::json!(format!("{}/style/themes", TYPE_MARK.as_str()))),
         "zoomFactor" => Some(serde_json::json!(1.0)),
         "sidebarTab" => Some(serde_json::json!("outline")),
         "sidebarWidth" => Some(serde_json::json!(260)),
@@ -883,7 +902,7 @@ extern "C" fn start_task(_this: &Object, _cmd: Sel, _webview: *mut Object, task:
 
         eprintln!("[notypo] serve {path}");
         let rel = path.trim_start_matches('/');
-        let file_path = format!("{TYPE_MARK}/{rel}");
+        let file_path = format!("{}/{}", TYPE_MARK.as_str(), rel);
         let (data, ok) = match std::fs::read(&file_path) {
             Ok(data) => (data, true),
             Err(err) => {
@@ -1574,6 +1593,7 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
         // get synchronous JS↔native calls on WKWebView.
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let theme = current_theme();
+        let tm = TYPE_MARK.as_str();
         let init_js = format!(
             "window.reqnode=undefined;\
              window.require=undefined;\
@@ -1582,8 +1602,8 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
              curTheme:'{theme}',\
              hasLicense:true,\
              enableDiagram:true,\
-             currentThemeFolder:'{TYPE_MARK}/style/themes',\
-             appPath:'{TYPE_MARK}',\
+             currentThemeFolder:'{tm}/style/themes',\
+             appPath:'{tm}',\
              userDataPath:'{home}/Library/Application Support/notypo',\
              documentsPath:'{home}/Documents',\
              mountFolder:null,\
@@ -1808,8 +1828,8 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
         let _: () = msg_send![content, addSubview: webview];
 
         let index_url: *mut Object =
-            msg_send![class!(NSURL), fileURLWithPath: nsstring(&format!("{TYPE_MARK}/index.html"))];
-        let access_url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: nsstring(TYPE_MARK)];
+            msg_send![class!(NSURL), fileURLWithPath: nsstring(&format!("{}/index.html", TYPE_MARK.as_str()))];
+        let access_url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: nsstring(&TYPE_MARK)];
         let _: () = msg_send![webview, loadFileURL: index_url allowingReadAccessToURL: access_url];
         let _: () = msg_send![win, makeKeyAndOrderFront: ptr::null::<Object>()];
 
@@ -2013,6 +2033,34 @@ fn register_app_delegate() {
     cls.register();
 }
 
+/// Set the Dock/app icon at runtime. In a packaged bundle the icon comes from
+/// `Contents/Resources/app-icon.png` (the .icns is used by LaunchServices for
+/// Finder/Dock); in dev (`cargo run`) it falls back to
+/// `<manifest>/assets/app-icon.png`. This keeps the Dock icon consistent in
+/// both modes and overrides the default Rust/Hornbeam icon.
+unsafe fn set_app_icon(app: *mut Object) {
+    let candidate = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent().and_then(|macos| macos.parent()).map(|contents| {
+            contents.join("Resources").join("app-icon.png")
+        })
+    }).or_else(|| {
+        Path::new(TYPE_MARK_DEV).parent().map(|assets| assets.join("app-icon.png"))
+    });
+    let Some(path) = candidate else { return; };
+    if !path.is_file() {
+        return;
+    }
+    let path_str = path.to_string_lossy();
+    let img: *mut Object = msg_send![class!(NSImage), alloc];
+    let img: *mut Object = msg_send![img, initWithContentsOfFile: nsstring(&path_str)];
+    if img.is_null() {
+        let _: () = msg_send![img, release];
+        return;
+    }
+    let _: () = msg_send![app, setApplicationIconImage: img];
+    let _: () = msg_send![img, release];
+}
+
 fn load_document_from_cli() {
     let Some(path) = std::env::args().nth(1) else {
         return;
@@ -2028,6 +2076,7 @@ fn main() {
         register_app_delegate();
         register_menu_target();
         let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        set_app_icon(app);
         let _: () = msg_send![app, setActivationPolicy: 0u64];
         install_main_menu(app);
         let delegate: *mut Object = msg_send![class!(NotypoAppDelegate), new];
