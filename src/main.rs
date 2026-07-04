@@ -275,6 +275,13 @@ fn call_sync(name: &str, method: &str, data: &serde_json::Value) -> String {
         "document.isDocumentEdited" => {
             with_document(|doc| doc.is_edited()).to_string()
         }
+        "document.displayName" => {
+            // Current document file name (e.g. "README.md"), JSON-encoded so the
+            // JS side can `JSON.parse` it. Used by the injected titlebar renderer
+            // to show a centered file name in the seamless `<titlebar>`.
+            let name = with_document(|doc| doc.display_name());
+            serde_json::to_string(&name).unwrap_or_else(|_| "\"\"".to_string())
+        }
         "images.convertFakeUrl" => {
             // Pass through — we don't use fake URLs, just return as-is.
             data.as_str().unwrap_or("").to_string()
@@ -603,18 +610,31 @@ unsafe fn update_window_title() {
     }
     let (title, path, edited) =
         with_document(|doc| (doc.display_name(), doc.path.clone(), doc.is_edited()));
-    // Typora-style titlebar: show only the clean document name. AppKit renders
-    // it centered in the merged (full-size-content) titlebar — no " — notypo"
-    // app-name suffix and no manual dirty bullet.
+    // The native title text is hidden (see window setup); we still set it to the
+    // clean document name so it drives the window's menu-bar / Mission Control
+    // label and the Dock. The visible titlebar name is web-rendered below.
     let _: () = msg_send![WINDOW, setTitle: nsstring(&title)];
-    // Set the represented file so AppKit draws the document proxy icon next to
-    // the title (and lays the title out as a standard centered document
-    // window). An empty string clears it for untitled documents.
+    // Set the represented file so AppKit shows the document proxy icon in the
+    // Dock / window menu. An empty string clears it for untitled documents.
     let represented = path.unwrap_or_default();
     let _: () = msg_send![WINDOW, setRepresentedFilename: nsstring(&represented)];
     // Native "edited" indicator (shown on the proxy icon / close button)
     // instead of appending a bullet to the title text.
     let _: () = msg_send![WINDOW, setDocumentEdited: if edited { YES } else { NO }];
+    // The visible title is drawn by the web `<titlebar>`; push the current name
+    // for live updates (opening a file reloads the webview, in which case the
+    // injected script pulls the name itself, so this is a no-op then).
+    apply_current_title_to_webview();
+}
+
+/// Push the current document name into the live webview's seamless `<titlebar>`
+/// (via the injected `__notypoSetTitle` helper).
+unsafe fn apply_current_title_to_webview() {
+    let name = with_document(|doc| doc.display_name());
+    let escaped = name.replace('\\', "\\\\").replace('\'', "\\'");
+    evaluate_js(&format!(
+        "window.__notypoSetTitle && window.__notypoSetTitle('{escaped}');"
+    ));
 }
 
 unsafe fn move_window_by(dx: f64, dy: f64) {
@@ -1555,14 +1575,16 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
         update_window_title();
         let _: () = msg_send![win, setTitlebarAppearsTransparent: YES];
         let _: () = msg_send![win, setMovableByWindowBackground: YES];
-        // Keep the native title *visible* (NSWindowTitleVisible = 0). The release
-        // TypeMark DOM has no `#title-text`/`#top-titlebar` element (that's only
-        // for the Windows/Linux custom chrome), so the document name can only be
-        // shown via the native window title. With the full-size content view it is
-        // drawn centered over the web content — matching Typora, where the file
-        // name sits in the middle of the merged titlebar. It won't collide with
-        // the left-hand outline sidebar, which is far from the centered title.
-        let _: () = msg_send![win, setTitleVisibility: 0u64];
+        // Hide the native title text (NSWindowTitleHidden = 1). On macOS 11+
+        // the native title is drawn *left-aligned* next to the traffic lights
+        // and cannot be centered or given a document proxy icon reliably in a
+        // transparent full-size-content titlebar. Instead we render the file
+        // name ourselves — centered, with a document glyph — inside TypeMark's
+        // seamless `<titlebar>` element (see the injected `__notypoSetTitle`
+        // helper below). This matches Typora's seamless-mode titlebar. The
+        // represented file / documentEdited state set in `update_window_title`
+        // still drives the Dock proxy and the close-button "edited" dot.
+        let _: () = msg_send![win, setTitleVisibility: 1u64];
         let _: () = msg_send![win, center];
         let _: () = msg_send![win, setReleasedWhenClosed: NO];
 
@@ -1686,7 +1708,43 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
                 opts.theme = theme;\n\
                 opts.curTheme = theme;\n\
               } catch (e) { console.error(e); }\n\
-            };";
+            };\n\
+            (function () {\n\
+              var st = document.createElement('style');\n\
+              st.textContent = 'titlebar .notypo-title{position:fixed;top:0;left:0;right:0;height:var(--title-bar-height);display:flex;align-items:center;justify-content:center;pointer-events:none;font-size:13px;line-height:1;color:var(--text-color);opacity:.62;z-index:1;-webkit-user-select:none;user-select:none;}titlebar .notypo-title svg{width:14px;height:14px;margin-right:5px;opacity:.9;flex:none;}titlebar .notypo-title .notypo-title-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55vw;}';\n\
+              (document.head || document.documentElement).appendChild(st);\n\
+            })();\n\
+            window.__notypoSetTitle = function (name) {\n\
+              try {\n\
+                window.__notypoTitle = name || '';\n\
+                var tb = document.querySelector('titlebar');\n\
+                if (!tb) return;\n\
+                var box = tb.querySelector('.notypo-title');\n\
+                if (!box) {\n\
+                  box = document.createElement('span');\n\
+                  box.className = 'notypo-title';\n\
+                  box.innerHTML = \"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'/><path d='M14 2v6h6'/></svg><span class='notypo-title-name'></span>\";\n\
+                  tb.appendChild(box);\n\
+                }\n\
+                var nameEl = box.querySelector('.notypo-title-name');\n\
+                if (nameEl) nameEl.textContent = window.__notypoTitle;\n\
+              } catch (e) { console.error(e); }\n\
+            };\n\
+            (function () {\n\
+              function pull() {\n\
+                var name = '';\n\
+                try {\n\
+                  var res = window.prompt('__bridge__', JSON.stringify({ name: 'document', method: 'displayName', data: null }));\n\
+                  if (res) name = JSON.parse(res);\n\
+                } catch (e) {}\n\
+                if (window.__notypoSetTitle) window.__notypoSetTitle(name);\n\
+              }\n\
+              if (document.readyState === 'loading') {\n\
+                document.addEventListener('DOMContentLoaded', pull);\n\
+              } else {\n\
+                pull();\n\
+              }\n\
+            })();";
         let seamless_script: *mut Object = msg_send![class!(WKUserScript), alloc];
         let seamless_script: *mut Object = msg_send![
             seamless_script,
