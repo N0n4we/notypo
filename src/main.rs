@@ -732,9 +732,12 @@ unsafe fn push_mount_folder_to_typemark(show_sidebar: bool) {
                 l.root = null;
                 if (folder) {{
                     if ({show}) {{
+                        // Explicit "open folder" — reveal the sidebar on the file tree.
                         l.showSidebar('file-tree');
-                    }} else if (l.isFileTabShown && l.isFileTabShown()) {{
-                        l.switch('file-tree', true);
+                    }} else {{
+                        // Opening a file (or launch): refresh the file-tree data in
+                        // the background but do NOT switch the active tab, so the
+                        // sidebar keeps showing the Outline tab by default.
                         if (l.fileTree && l.fileTree.render) l.fileTree.render(true);
                     }}
                 }}
@@ -1896,7 +1899,14 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
 
         let index_url: *mut Object =
             msg_send![class!(NSURL), fileURLWithPath: nsstring(&format!("{}/index.html", TYPE_MARK.as_str()))];
-        let access_url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: nsstring(&TYPE_MARK)];
+        // Grant the webview read access to the whole filesystem root, not just
+        // the bundled TypeMark assets. Documents live outside the app bundle and
+        // reference local images by absolute/relative `file://` paths (e.g.
+        // `![](img/pic.png)` resolved against the document folder). WKWebView
+        // blocks `file://` loads outside the `allowingReadAccessToURL:` subtree,
+        // so scoping this to TYPE_MARK made every document-relative image fail to
+        // render. Rooting it at "/" lets local images load, matching Typora.
+        let access_url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: nsstring("/")];
         let _: () = msg_send![webview, loadFileURL: index_url allowingReadAccessToURL: access_url];
         let _: () = msg_send![win, makeKeyAndOrderFront: ptr::null::<Object>()];
 
