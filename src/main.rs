@@ -421,6 +421,13 @@ fn set_mount_folder(path: Option<String>) {
     *MOUNT_FOLDER.lock().expect("mount folder mutex poisoned") = path;
 }
 
+fn set_mount_folder_if_empty(path: Option<String>) {
+    let mut mount = MOUNT_FOLDER.lock().expect("mount folder mutex poisoned");
+    if mount.is_none() {
+        *mount = path;
+    }
+}
+
 fn current_mount_folder() -> Option<String> {
     MOUNT_FOLDER
         .lock()
@@ -558,7 +565,7 @@ fn save_document_to(path: Option<String>) -> std::io::Result<String> {
         doc.edited = false;
     });
     record_recent_file(&path);
-    set_mount_folder(Path::new(&path).parent().map(|p| p.to_string_lossy().into_owned()));
+    set_mount_folder_if_empty(Path::new(&path).parent().map(|p| p.to_string_lossy().into_owned()));
     unsafe { update_window_title(); }
     Ok(path)
 }
@@ -567,7 +574,6 @@ fn open_document_from(path: String) -> std::io::Result<()> {
     let next = DocumentState::open(path.clone())?;
     with_document(|doc| *doc = next);
     record_recent_file(&path);
-    set_mount_folder(Path::new(&path).parent().map(|p| p.to_string_lossy().into_owned()));
     unsafe { update_window_title(); }
     Ok(())
 }
@@ -581,6 +587,19 @@ unsafe fn update_window_title() {
         format!("{}{} — notypo", doc.display_name(), dirty)
     });
     let _: () = msg_send![WINDOW, setTitle: nsstring(&title)];
+}
+
+unsafe fn move_window_by(dx: f64, dy: f64) {
+    if WINDOW.is_null() {
+        return;
+    }
+    let frame: NSRect = msg_send![WINDOW, frame];
+    let origin = NSPoint {
+        x: frame.origin.x + dx,
+        // Browser screen coordinates grow downward; AppKit window origins grow upward.
+        y: frame.origin.y - dy,
+    };
+    let _: () = msg_send![WINDOW, setFrameOrigin: origin];
 }
 
 unsafe fn run_open_panel(select_folder: bool) -> Option<String> {
@@ -1017,6 +1036,14 @@ fn bridge_response(handler: &str, msg: &serde_json::Value) -> serde_json::Value 
             serde_json::json!(path.and_then(|p| save_document_to(Some(p)).ok()))
         },
         "controller.shouldLoadFolder" => serde_json::json!(current_mount_folder().is_some()),
+        "window.dragBy" => {
+            if let Some(delta) = data.as_array() {
+                let dx = delta.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let dy = delta.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                unsafe { move_window_by(dx, dy); }
+            }
+            serde_json::json!(true)
+        }
         "window.updateMenuForIsAlwaysOnTop" => serde_json::json!(false),
         "window.loadFinished" => serde_json::json!(true),
         "window.refreshFullContentState"
@@ -1499,6 +1526,7 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
         WINDOW = win;
         update_window_title();
         let _: () = msg_send![win, setTitlebarAppearsTransparent: YES];
+        let _: () = msg_send![win, setMovableByWindowBackground: YES];
         // Keep the native title *visible* (NSWindowTitleVisible = 0). The release
         // TypeMark DOM has no `#title-text`/`#top-titlebar` element (that's only
         // for the Windows/Linux custom chrome), so the document name can only be
@@ -1594,6 +1622,30 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
         let seamless_js = "\
             document.documentElement.classList.add('mac-supports-vibrant');\n\
             document.body.classList.add('mac-seamless-mode');\n\
+            (function () {\n\
+              var dragging = false;\n\
+              var lastX = 0;\n\
+              var lastY = 0;\n\
+              function stopDrag() { dragging = false; }\n\
+              document.addEventListener('mousedown', function (event) {\n\
+                if (event.button !== 0 || !event.target || event.target.tagName !== 'TITLEBAR') return;\n\
+                dragging = true;\n\
+                lastX = event.screenX;\n\
+                lastY = event.screenY;\n\
+                event.preventDefault();\n\
+              }, true);\n\
+              document.addEventListener('mousemove', function (event) {\n\
+                if (!dragging) return;\n\
+                var dx = event.screenX - lastX;\n\
+                var dy = event.screenY - lastY;\n\
+                lastX = event.screenX;\n\
+                lastY = event.screenY;\n\
+                if ((dx || dy) && window.bridge) bridge.callHandler('window.dragBy', [dx, dy]);\n\
+                event.preventDefault();\n\
+              }, true);\n\
+              document.addEventListener('mouseup', stopDrag, true);\n\
+              window.addEventListener('blur', stopDrag);\n\
+            })();\n\
             window.__notypoSetTheme = function (theme) {\n\
               try {\n\
                 var opts = window._options || {};\n\
@@ -1791,6 +1843,7 @@ fn open_path_and_reload(path: String) -> bool {
         }
         return true;
     }
+    set_mount_folder_if_empty(Path::new(&path).parent().map(|p| p.to_string_lossy().into_owned()));
     match open_document_from(path) {
         Ok(()) => {
             unsafe {
@@ -2052,5 +2105,23 @@ mod tests {
         assert_eq!(load[2]["currentFilePath"], path.to_string_lossy().to_string());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn opening_nested_file_keeps_existing_mount_folder() {
+        let _guard = TEST_LOCK.lock().expect("test lock poisoned");
+        let root = std::env::temp_dir().join(format!("notypo-mount-{}", std::process::id()));
+        let child = root.join("child");
+        let path = child.join("nested.md");
+        std::fs::create_dir_all(&child).expect("create child directory");
+        std::fs::write(&path, "# Nested\n").expect("create nested markdown file");
+        set_mount_folder(Some(root.to_string_lossy().into_owned()));
+
+        assert!(open_path_and_reload(path.to_string_lossy().to_string()));
+        assert_eq!(current_mount_folder(), Some(root.to_string_lossy().into_owned()));
+        assert_eq!(document_load_response()[0], "# Nested\n");
+
+        set_mount_folder(None);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

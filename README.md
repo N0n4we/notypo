@@ -6,7 +6,7 @@ Notypo is a macOS Markdown editor built around a Typora-style live preview exper
 
 - Live Preview Markdown editing: Markdown syntax is rendered in place while you write, keeping the document readable without switching between edit and preview panes.
 - Standard document workflow: create new documents, open existing Markdown files, save, and save as from the native macOS menu.
-- Native macOS window and menu integration: common shortcuts for New, Open, Save, Undo, Redo, Cut, Copy, Paste, and Select All are wired through the app menu.
+- Native macOS window and menu integration: common shortcuts for New, Open, Save, Undo, Redo, Cut, Copy, Paste, and Select All are wired through the app menu, and the seamless titlebar can be dragged to move the window.
 - Sidebar table of contents: the sidebar can show a document outline generated from headings, and `View -> Toggle Outline` toggles it quickly.
 - Sidebar file navigation: the sidebar also includes file list / file tree views for navigating nearby files. The top-left sidebar button switches between TOC and file navigation.
 - Search and replace UI: document search supports normal search controls plus case-sensitive, whole-word, and regular-expression options.
