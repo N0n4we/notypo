@@ -1,0 +1,11 @@
+:root {
+	--mermaid-theme: default;
+	--mermaid-sequence-numbers: off;
+	--mermaid-flowchart-curve: linear;
+	--mermaid--gantt-left-padding: 75;
+	--sequence-theme: simple;
+}
+
+.privacy {
+  display:none;
+}
