@@ -13,6 +13,7 @@ use std::ffi::CString;
 use std::path::Path;
 use std::ptr;
 use std::sync::{LazyLock, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const TYPE_MARK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/TypeMark");
 
@@ -23,6 +24,7 @@ static mut MENU_TARGET: *mut Object = ptr::null_mut();
 static DOCUMENT: LazyLock<Mutex<DocumentState>> =
     LazyLock::new(|| Mutex::new(DocumentState::untitled()));
 static RECENT_FILES: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static MOUNT_FOLDER: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 
 #[repr(C)]
@@ -319,6 +321,7 @@ fn setting_get(key: &str) -> Option<serde_json::Value> {
         "zoomFactor" => Some(serde_json::json!(1.0)),
         "sidebarTab" => Some(serde_json::json!("outline")),
         "sidebarWidth" => Some(serde_json::json!(260)),
+        "useTreeStyle" => Some(serde_json::json!(true)),
         "useCRLF" => Some(serde_json::json!(false)),
         "autoPair" => Some(serde_json::json!(true)),
         "autoMatch" => Some(serde_json::json!(true)),
@@ -334,7 +337,7 @@ fn setting_get(key: &str) -> Option<serde_json::Value> {
 fn settings_all() -> serde_json::Value {
     let keys = [
         "theme", "curTheme", "hasLicense", "currentThemeFolder", "zoomFactor",
-        "sidebarTab", "sidebarWidth", "useCRLF", "autoPair", "autoMatch",
+        "sidebarTab", "sidebarWidth", "useTreeStyle", "useCRLF", "autoPair", "autoMatch",
         "exportType", "isEncodeUTF8", "fontSize", "editorFontSize",
         "fontFamily", "editorFontFamily",
     ];
@@ -414,6 +417,116 @@ fn recent_files_json() -> serde_json::Value {
     }).collect::<Vec<_>>())
 }
 
+fn set_mount_folder(path: Option<String>) {
+    *MOUNT_FOLDER.lock().expect("mount folder mutex poisoned") = path;
+}
+
+fn current_mount_folder() -> Option<String> {
+    MOUNT_FOLDER
+        .lock()
+        .expect("mount folder mutex poisoned")
+        .clone()
+        .or_else(|| with_document(|doc| doc.folder()))
+}
+
+fn file_time_millis(time: std::io::Result<SystemTime>) -> u128 {
+    time.ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn file_tree_node(path: &Path, include_children: bool) -> Option<serde_json::Value> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let is_dir = metadata.is_dir();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let mut subdir = Vec::new();
+    let mut content = Vec::new();
+
+    if is_dir && include_children {
+        let mut entries = std::fs::read_dir(path)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let entry_path = entry.path();
+                let entry_name = entry_path.file_name()?.to_str()?;
+                if entry_name.starts_with('.') {
+                    return None;
+                }
+                file_tree_node(&entry_path, false)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| {
+            let a_dir = a["isDirectory"].as_bool().unwrap_or(false);
+            let b_dir = b["isDirectory"].as_bool().unwrap_or(false);
+            b_dir
+                .cmp(&a_dir)
+                .then_with(|| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")))
+        });
+        for node in entries {
+            if node["isDirectory"].as_bool().unwrap_or(false) {
+                subdir.push(node);
+            } else {
+                content.push(node);
+            }
+        }
+    } else if is_dir {
+        let mut has_subdir = false;
+        let mut has_content = false;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.filter_map(Result::ok) {
+                if let Ok(child_meta) = entry.metadata() {
+                    if child_meta.is_dir() {
+                        has_subdir = true;
+                    } else if child_meta.is_file() {
+                        has_content = true;
+                    }
+                }
+                if has_subdir && has_content {
+                    break;
+                }
+            }
+        }
+        if has_subdir {
+            subdir.push(serde_json::json!({
+                "name": "",
+                "path": format!("{}/", path.to_string_lossy()),
+                "isDirectory": true,
+                "isFile": false,
+                "subdir": [],
+                "content": []
+            }));
+        }
+        if has_content {
+            content.push(serde_json::json!({
+                "name": "",
+                "path": format!("{}/.notypo-placeholder", path.to_string_lossy()),
+                "isDirectory": false,
+                "isFile": true
+            }));
+        }
+    }
+
+    Some(serde_json::json!({
+        "name": name,
+        "path": path.to_string_lossy(),
+        "isDirectory": is_dir,
+        "isFile": metadata.is_file(),
+        "subdir": subdir,
+        "content": content,
+        "lastModified": file_time_millis(metadata.modified()),
+        "createDate": file_time_millis(metadata.created()),
+    }))
+}
+
+fn folder_tree_json(path: &str) -> serde_json::Value {
+    file_tree_node(Path::new(path), true).unwrap_or(serde_json::Value::Null)
+}
+
 
 fn document_load_response() -> serde_json::Value {
     with_document(|doc| serde_json::json!([doc.content, null, doc.typemark_state()]))
@@ -445,6 +558,7 @@ fn save_document_to(path: Option<String>) -> std::io::Result<String> {
         doc.edited = false;
     });
     record_recent_file(&path);
+    set_mount_folder(Path::new(&path).parent().map(|p| p.to_string_lossy().into_owned()));
     unsafe { update_window_title(); }
     Ok(path)
 }
@@ -453,6 +567,7 @@ fn open_document_from(path: String) -> std::io::Result<()> {
     let next = DocumentState::open(path.clone())?;
     with_document(|doc| *doc = next);
     record_recent_file(&path);
+    set_mount_folder(Path::new(&path).parent().map(|p| p.to_string_lossy().into_owned()));
     unsafe { update_window_title(); }
     Ok(())
 }
@@ -533,6 +648,32 @@ unsafe fn reload_webview_document() {
     if !WEBVIEW.is_null() {
         let _: () = msg_send![WEBVIEW, reload];
     }
+}
+
+unsafe fn push_mount_folder_to_typemark(show_sidebar: bool) {
+    let folder = current_mount_folder();
+    let folder_json = serde_json::to_string(&folder).unwrap_or_else(|_| "null".to_string());
+    let show = if show_sidebar { "true" } else { "false" };
+    evaluate_js(&format!(
+        r#"(function () {{
+            var folder = {folder_json};
+            if (window.File) {{
+                File.mountFolder_ = folder;
+            }}
+            var l = File.editor && File.editor.library;
+            if (l) {{
+                l.root = null;
+                if (folder) {{
+                    if ({show}) {{
+                        l.showSidebar('file-tree');
+                    }} else if (l.isFileTabShown && l.isFileTabShown()) {{
+                        l.switch('file-tree', true);
+                        if (l.fileTree && l.fileTree.render) l.fileTree.render(true);
+                    }}
+                }}
+            }}
+        }})()"#
+    ));
 }
 
 unsafe fn sync_editor_then(handler: &str) {
@@ -875,7 +1016,7 @@ fn bridge_response(handler: &str, msg: &serde_json::Value) -> serde_json::Value 
             let path = data.as_str().map(ToOwned::to_owned).or_else(|| run_save_panel());
             serde_json::json!(path.and_then(|p| save_document_to(Some(p)).ok()))
         },
-        "controller.shouldLoadFolder" => serde_json::json!(null),
+        "controller.shouldLoadFolder" => serde_json::json!(current_mount_folder().is_some()),
         "window.updateMenuForIsAlwaysOnTop" => serde_json::json!(false),
         "window.loadFinished" => serde_json::json!(true),
         "window.refreshFullContentState"
@@ -1016,7 +1157,14 @@ fn bridge_response(handler: &str, msg: &serde_json::Value) -> serde_json::Value 
         // --- controller.* ---
         "controller.openFolder" | "controller.switchFolder" => {
             if let Some(path) = data.as_str() {
-                let _ = open_path_and_reload(path.to_string());
+                if Path::new(path).is_dir() {
+                    set_mount_folder(Some(path.to_string()));
+                    unsafe {
+                        push_mount_folder_to_typemark(true);
+                    }
+                } else {
+                    let _ = open_path_and_reload(path.to_string());
+                }
             }
             serde_json::json!(null)
         }
@@ -1027,7 +1175,14 @@ fn bridge_response(handler: &str, msg: &serde_json::Value) -> serde_json::Value 
             }
             serde_json::json!(null)
         }
-        "controller.calcMountFolder" => serde_json::json!(null),
+        "controller.selectFolder" => unsafe {
+            if let Some(path) = run_open_panel(true) {
+                set_mount_folder(Some(path));
+                push_mount_folder_to_typemark(true);
+            }
+            serde_json::json!(null)
+        }
+        "controller.calcMountFolder" => serde_json::json!(current_mount_folder()),
         "controller.openInNewWindow" | "controller.openInTypora" => {
             if let Some(path) = data.as_str() {
                 let _ = open_path_and_reload(path.to_string());
@@ -1038,8 +1193,14 @@ fn bridge_response(handler: &str, msg: &serde_json::Value) -> serde_json::Value 
             eprintln!("[bridge] error dialog: {}", data);
             serde_json::json!(null)
         }
-        "controller.switchDocumentTarget" | "controller.startDrag"
-        | "controller.bindFolderMonitor" | "controller.selectFolder" => serde_json::json!(null),
+        "controller.switchDocumentTarget" => {
+            let opened = data
+                .as_str()
+                .map(|path| open_path_and_reload(path.to_string()))
+                .unwrap_or(false);
+            serde_json::json!(opened)
+        }
+        "controller.startDrag" | "controller.bindFolderMonitor" => serde_json::json!(null),
         // --- clipboard.* ---
         "clipboard.read" => {
             // TypeMark expects [text, html, rtf] array.
@@ -1066,7 +1227,17 @@ fn bridge_response(handler: &str, msg: &serde_json::Value) -> serde_json::Value 
         "setting.fetchAnalytics" => serde_json::json!(null),
         "setting.showAndHighlight" => serde_json::json!(null),
         // --- library.* ---
-        "library.fetchAllDocs" | "library.listDocsUnder" | "library.search" => serde_json::json!([]),
+        "library.fetchAllDocs" => {
+            data.as_str()
+                .map(folder_tree_json)
+                .unwrap_or_else(|| current_mount_folder().map(|p| folder_tree_json(&p)).unwrap_or(serde_json::json!([])))
+        }
+        "library.listDocsUnder" => {
+            data.as_str()
+                .map(folder_tree_json)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        "library.search" => serde_json::json!([]),
         "library.getRecentFolders" => serde_json::json!({ "folders": [] }),
         "library.newFile" | "library.newFileUnder" | "library.newFolder"
         | "library.renameFile" | "library.moveFile" | "library.duplicate"
@@ -1396,6 +1567,7 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
              zoomFactor:1.0,\
              sidebarTab:'outline',\
              sidebarWidth:260,\
+             useTreeStyle:true,\
              searchService:'',\
              tooOldToReport:false,\
              onFirstLaunch:false\
@@ -1612,6 +1784,13 @@ extern "C" fn system_theme_changed(_this: &Object, _cmd: Sel, _notification: *mu
 }
 
 fn open_path_and_reload(path: String) -> bool {
+    if Path::new(&path).is_dir() {
+        set_mount_folder(Some(path));
+        unsafe {
+            push_mount_folder_to_typemark(true);
+        }
+        return true;
+    }
     match open_document_from(path) {
         Ok(()) => {
             unsafe {
@@ -1647,8 +1826,14 @@ unsafe fn push_file_to_typemark() {
             doc.typemark_state(),
         )
     });
-    // File.loadFile(content) — JS handler calls File.loadFile(null, true, content)
-    call_js_handler("File.loadFile", serde_json::json!(content));
+    // Load content directly as File.loadFile's third argument. The Mac branch
+    // expects the same tuple returned by document.loadData: [content, snap, state].
+    let load_data = serde_json::json!([content, null, state.clone()]);
+    if let Ok(load_arg) = serde_json::to_string(&load_data) {
+        evaluate_js(&format!(
+            "if (window.File && File.loadFile) {{ File.loadFile(null, true, {load_arg}); }}"
+        ));
+    }
     // File.setFilePath([filePath, fileName, folderPath])
     if let Some(p) = path {
         call_js_handler(
@@ -1665,6 +1850,7 @@ unsafe fn push_file_to_typemark() {
     );
     // Push recent files.
     push_recent_files_to_typemark();
+    push_mount_folder_to_typemark(false);
 }
 
 /// Reload document content from disk and push to TypeMark.
@@ -1690,8 +1876,9 @@ unsafe fn reload_content_from_disk() {
         doc.change_count = 0;
         doc.edited = false;
     });
-    // File.reloadContent(content) — JS handler reloads editor with new content.
-    call_js_handler("File.reloadContent", serde_json::json!(content));
+    // The JS handler calls File.reloadContent.apply(File, data), so data must
+    // be an argument array. Passing a bare string would spread it by character.
+    call_js_handler("File.reloadContent", serde_json::json!([content]));
     call_js_handler(
         "document.updateChangeCount",
         serde_json::json!(4), // NSChangeAutoSaved
@@ -1800,8 +1987,11 @@ fn main() {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
     #[test]
     fn document_load_shape_and_save_write_disk() {
+        let _guard = TEST_LOCK.lock().expect("test lock poisoned");
         let path = std::env::temp_dir().join(format!("notypo-doc-{}.md", std::process::id()));
         with_document(|doc| {
             doc.path = Some(path.to_string_lossy().into_owned());
@@ -1825,5 +2015,42 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let recent = recent_files_json();
         assert_eq!(recent[0]["path"], saved);
+    }
+
+    #[test]
+    fn folder_tree_json_lists_files_and_folders() {
+        let _guard = TEST_LOCK.lock().expect("test lock poisoned");
+        let root = std::env::temp_dir().join(format!("notypo-tree-{}", std::process::id()));
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).expect("create child directory");
+        std::fs::write(root.join("note.md"), "# Note\n").expect("create markdown file");
+        std::fs::write(child.join("nested.md"), "# Nested\n").expect("create nested markdown file");
+
+        let tree = folder_tree_json(&root.to_string_lossy());
+        assert_eq!(tree["isDirectory"], true);
+        assert_eq!(tree["path"], root.to_string_lossy().to_string());
+        assert!(tree["subdir"].as_array().unwrap().iter().any(|node| node["name"] == "child"));
+        assert!(tree["content"].as_array().unwrap().iter().any(|node| node["name"] == "note.md"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn switch_document_target_opens_file() {
+        let _guard = TEST_LOCK.lock().expect("test lock poisoned");
+        let path = std::env::temp_dir().join(format!("notypo-open-{}.md", std::process::id()));
+        std::fs::write(&path, "# Opened from tree\n").expect("create markdown file");
+
+        let response = bridge_response(
+            "controller.switchDocumentTarget",
+            &serde_json::json!({ "data": path.to_string_lossy().to_string() }),
+        );
+
+        assert_eq!(response, true);
+        let load = document_load_response();
+        assert_eq!(load[0], "# Opened from tree\n");
+        assert_eq!(load[2]["currentFilePath"], path.to_string_lossy().to_string());
+
+        let _ = std::fs::remove_file(path);
     }
 }

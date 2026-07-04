@@ -8,8 +8,16 @@
   position: initial;
 }
 
+.html-for-mac .active-tab-files.use-file-tree-style .sidebar-content {
+  bottom: 0;
+}
+
+.html-for-mac .active-tab-files.use-file-tree-style #ty-sidebar-footer {
+  display: none !important;
+}
+
 .html-for-mac #typora-sidebar:hover #file-library-tree {
-  padding-bottom: 25px;
+  padding-bottom: 0;
 }
 
 .html-for-mac .sidebar-footer .sidebar-footer-item {
