@@ -580,15 +580,11 @@ extern "C" fn menu_new(_this: &Object, _cmd: Sel, _sender: *mut Object) {
     }
 }
 
-extern "C" fn menu_toggle_outline(_this: &Object, _cmd: Sel, _sender: *mut Object) {
-    // Toggle the sidebar TOC. If the sidebar is already showing the outline
-    // tab, hide it; otherwise reveal it with the outline tab active.
-    let js = "var l=File.editor&&File.editor.library; \
-              if(l){ \
-                l.isSidebarShown() && l.getActiveTab()==='outline' \
-                  ? l.hideSidebar() \
-                  : l.showSidebar('outline'); \
-              }";
+extern "C" fn menu_toggle_sidebar(_this: &Object, _cmd: Sel, _sender: *mut Object) {
+    // Toggle the file-tree sidebar. The outline/article view has been removed,
+    // so the sidebar only ever shows the file tree; this simply shows it when
+    // hidden and hides it when shown, mirroring the top-left sidebar button.
+    let js = "var l=File.editor&&File.editor.library; if(l){ l.toggleSidebar(); }";
     unsafe { evaluate_js(js); }
 }
 
@@ -601,7 +597,7 @@ fn register_menu_target() {
         cls.add_method(sel!(openDocument:), menu_open as extern "C" fn(&Object, Sel, *mut Object));
         cls.add_method(sel!(saveDocument:), menu_save as extern "C" fn(&Object, Sel, *mut Object));
         cls.add_method(sel!(saveDocumentAs:), menu_save_as as extern "C" fn(&Object, Sel, *mut Object));
-        cls.add_method(sel!(toggleOutline:), menu_toggle_outline as extern "C" fn(&Object, Sel, *mut Object));
+        cls.add_method(sel!(toggleSidebar:), menu_toggle_sidebar as extern "C" fn(&Object, Sel, *mut Object));
     }
     cls.register();
 }
@@ -672,10 +668,10 @@ unsafe fn install_main_menu(app: *mut Object) {
     add_menu_item(edit_menu, "Select All", sel!(selectAll:), "a", ptr::null_mut());
     let _: () = msg_send![edit_item, setSubmenu: edit_menu];
 
-    // View menu — toggle the sidebar TOC (outline).
+    // View menu — toggle the file-tree sidebar.
     let view_menu: *mut Object = msg_send![class!(NSMenu), alloc];
     let view_menu: *mut Object = msg_send![view_menu, initWithTitle: nsstring("View")];
-    add_menu_item(view_menu, "Toggle Outline", sel!(toggleOutline:), "\\", target);
+    add_menu_item(view_menu, "Toggle Sidebar", sel!(toggleSidebar:), "\\", target);
     let _: () = msg_send![view_item, setSubmenu: view_menu];
 
     let _: () = msg_send![app, setMainMenu: main_menu];
@@ -1394,7 +1390,7 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
              osVersion:'macOS',\
              buildTime:'',\
              zoomFactor:1.0,\
-             sidebarTab:'outline',\
+             sidebarTab:'file-tree',\
              sidebarWidth:260,\
              searchService:'',\
              tooOldToReport:false,\
@@ -1549,7 +1545,7 @@ extern "C" fn did_finish_launching(_this: &Object, _cmd: Sel, _notification: *mu
                         function snap(){ return l ? {shown: l.isSidebarShown(), tab: l.getActiveTab()} : {lib:false}; }
                         var before = snap();
                         if (l) {
-                            l.isSidebarShown() && l.getActiveTab()==='outline' ? l.hideSidebar() : l.showSidebar('outline');
+                            l.toggleSidebar();
                         }
                         setTimeout(function () {
                             var after = snap();
